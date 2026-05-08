@@ -6,6 +6,8 @@
 {
   "generated_at": "2026-05-08T10:00:00Z",
   "org": "my-org",
+  "base_url": "https://github.com",
+  "skill_count": 1,
   "skills": [
     {
       "name": "unit-test-writer",

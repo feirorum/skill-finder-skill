@@ -4,8 +4,10 @@ search_index.py — Search the cached skill index by keyword query.
 
 Usage:
   python search_index.py --query "unit testing python" [--top 5]
+  python search_index.py --list-all
 
 Prints JSON array of top matching skills to stdout.
+Prints an empty array if no skills match; use --list-all to browse all skills.
 """
 
 import os
@@ -17,10 +19,16 @@ import urllib.error
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 INDEX_REPO = os.environ.get("INDEX_REPO", "")
+GITHUB_BASE_URL = os.environ.get("GITHUB_BASE_URL", "https://github.com").rstrip("/")
+
+if GITHUB_BASE_URL == "https://github.com":
+    GITHUB_RAW_URL = "https://raw.githubusercontent.com"
+else:
+    GITHUB_RAW_URL = f"{GITHUB_BASE_URL}/raw"
 
 
 def fetch_index() -> dict | None:
-    url = f"https://raw.githubusercontent.com/{INDEX_REPO}/main/index/skills.json"
+    url = f"{GITHUB_RAW_URL}/{INDEX_REPO}/main/index/skills.json"
     req = urllib.request.Request(url, headers={"Authorization": f"token {GITHUB_TOKEN}"})
     try:
         with urllib.request.urlopen(req) as resp:
@@ -42,6 +50,9 @@ def score_skill(skill: dict, keywords: list[str]) -> int:
 
 
 def main():
+    if not GITHUB_TOKEN:
+        print("WARNING: GITHUB_TOKEN is not set; using unauthenticated access (strict rate limits)", file=sys.stderr)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--query", required=False, default="", help="Search query")
     parser.add_argument("--top", type=int, default=5, help="Number of results")
@@ -65,11 +76,9 @@ def main():
     scored = [(score_skill(s, keywords), s) for s in skills]
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # Filter out zero-score matches unless nothing else available
     matched = [s for score, s in scored if score > 0]
-    if not matched:
-        matched = [s for _, s in scored]  # Fall back to all
-
+    # No fallback to all-skills: an empty result means nothing matched.
+    # The caller should report this and offer --list-all or a refresh.
     print(json.dumps(matched[:args.top]))
 
 

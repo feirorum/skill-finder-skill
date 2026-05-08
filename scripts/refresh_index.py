@@ -45,6 +45,8 @@ HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
+_default_branch_cache: dict[str, str] = {}
+
 
 def gh_get(url: str) -> dict | list | None:
     req = urllib.request.Request(url, headers=HEADERS)
@@ -54,6 +56,24 @@ def gh_get(url: str) -> dict | list | None:
     except urllib.error.HTTPError as e:
         print(f"  HTTP {e.code} for {url}", file=sys.stderr)
         return None
+
+
+def get_default_branch(repo_full_name: str, repo_obj: dict) -> str:
+    """Return the default branch for a repo.
+
+    Uses the branch already present in the code-search result object when available,
+    falling back to a dedicated API call so repos not on 'main' are handled correctly.
+    """
+    if repo_full_name in _default_branch_cache:
+        return _default_branch_cache[repo_full_name]
+
+    branch = repo_obj.get("default_branch")
+    if not branch:
+        data = gh_get(f"{GITHUB_API_URL}/repos/{repo_full_name}")
+        branch = (data or {}).get("default_branch", "main")
+
+    _default_branch_cache[repo_full_name] = branch
+    return branch
 
 
 def find_all_skill_files() -> list[dict]:
@@ -80,9 +100,9 @@ def find_all_skill_files() -> list[dict]:
     return items
 
 
-def fetch_raw_file(repo_full_name: str, file_path: str) -> str | None:
+def fetch_raw_file(repo_full_name: str, file_path: str, branch: str) -> str | None:
     """Fetch raw file content from GitHub."""
-    url = f"{GITHUB_RAW_URL}/{repo_full_name}/main/{file_path}"
+    url = f"{GITHUB_RAW_URL}/{repo_full_name}/{branch}/{file_path}"
     req = urllib.request.Request(url, headers={"Authorization": f"token {GITHUB_TOKEN}"})
     try:
         with urllib.request.urlopen(req) as resp:
@@ -96,19 +116,33 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
     if not content.startswith("---"):
         return {}, content
 
-    end = content.find("---", 3)
+    # Match \n--- so that --- appearing inside a quoted value doesn't end the block early
+    end = content.find("\n---", 3)
     if end == -1:
         return {}, content
 
     frontmatter_str = content[3:end].strip()
-    body = content[end + 3:].strip()
+    body = content[end + 4:].strip()
 
-    # Simple key: value parser (handles single-line values, not nested YAML)
     meta = {}
-    for line in frontmatter_str.splitlines():
+    lines = frontmatter_str.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         if ":" in line:
             key, _, val = line.partition(":")
-            meta[key.strip()] = val.strip().strip('"').strip("'")
+            val = val.strip().strip('"').strip("'")
+            if val in (">", "|", ">-", "|-", ">+", "|+"):
+                # Block scalar: collect subsequent indented lines as the value
+                block_lines = []
+                i += 1
+                while i < len(lines) and (not lines[i] or lines[i][0] in (" ", "\t")):
+                    block_lines.append(lines[i].strip())
+                    i += 1
+                meta[key.strip()] = " ".join(filter(None, block_lines))
+                continue
+            meta[key.strip()] = val
+        i += 1
 
     return meta, body
 
@@ -152,10 +186,11 @@ def build_index(skill_files: list[dict]) -> list[dict]:
         repo = item["repository"]
         full_name = repo["full_name"]
         file_path = item["path"]  # e.g. "SKILL.md" or "skills/unit-test/SKILL.md"
+        branch = get_default_branch(full_name, repo)
 
-        print(f"  Indexing {full_name}/{file_path}...", file=sys.stderr)
+        print(f"  Indexing {full_name}/{file_path} (branch: {branch})...", file=sys.stderr)
 
-        content = fetch_raw_file(full_name, file_path)
+        content = fetch_raw_file(full_name, file_path, branch)
         if not content:
             print(f"    Could not fetch, skipping", file=sys.stderr)
             skipped.append(f"{full_name}/{file_path}")
@@ -180,8 +215,8 @@ def build_index(skill_files: list[dict]) -> list[dict]:
             "description": description,
             "tags": tags,
             "summary": summary,
-            "raw_url": f"{GITHUB_RAW_URL}/{full_name}/main/{file_path}",
-            "html_url": f"{GITHUB_BASE_URL}/{full_name}/blob/main/{file_path}",
+            "raw_url": f"{GITHUB_RAW_URL}/{full_name}/{branch}/{file_path}",
+            "html_url": f"{GITHUB_BASE_URL}/{full_name}/blob/{branch}/{file_path}",
             "last_indexed": now,
         })
 
@@ -204,33 +239,63 @@ def commit_index(skills: list[dict]):
     }
 
     hostname = GITHUB_BASE_URL.replace("https://", "").replace("http://", "")
-    clone_url = f"https://{GITHUB_TOKEN}@{hostname}/{INDEX_REPO}.git"
+    # Token is supplied via GIT_ASKPASS to keep it out of the clone URL and process args
+    clone_url = f"https://x-access-token@{hostname}/{INDEX_REPO}.git"
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        subprocess.run(["git", "clone", "--depth=1", clone_url, tmpdir], check=True, capture_output=True)
+    # Write askpass script to a separate temp file so the clone target dir stays empty
+    askpass_fd, askpass_path = tempfile.mkstemp(prefix="git_askpass_")
+    try:
+        os.write(askpass_fd, b"#!/bin/sh\necho \"$_GIT_TOKEN\"\n")
+        os.close(askpass_fd)
+        os.chmod(askpass_path, 0o700)
+        git_env = {**os.environ, "GIT_ASKPASS": askpass_path, "_GIT_TOKEN": GITHUB_TOKEN}
 
-        index_dir = os.path.join(tmpdir, "index")
-        os.makedirs(index_dir, exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(
+                ["git", "clone", "--depth=1", clone_url, tmpdir],
+                check=True, capture_output=True, env=git_env,
+            )
 
-        with open(os.path.join(index_dir, "skills.json"), "w") as f:
-            json.dump(index_data, f, indent=2)
+            index_dir = os.path.join(tmpdir, "index")
+            os.makedirs(index_dir, exist_ok=True)
 
-        with open(os.path.join(index_dir, "timestamp.txt"), "w") as f:
-            f.write(now + "\n")
+            with open(os.path.join(index_dir, "skills.json"), "w") as f:
+                json.dump(index_data, f, indent=2)
 
-        subprocess.run(["git", "-C", tmpdir, "add", "index/"], check=True)
+            with open(os.path.join(index_dir, "timestamp.txt"), "w") as f:
+                f.write(now + "\n")
 
-        result = subprocess.run(
-            ["git", "-C", tmpdir, "commit", "-m", "chore: refresh skill index [skip ci]"],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            if b"nothing to commit" in result.stdout + result.stderr:
-                print("Index unchanged, nothing to commit.")
+            subprocess.run(
+                ["git", "-C", tmpdir, "add", "index/"],
+                check=True, env=git_env,
+            )
+
+            result = subprocess.run(
+                ["git", "-C", tmpdir, "commit", "-m", "chore: refresh skill index [skip ci]"],
+                capture_output=True, env=git_env,
+            )
+            if result.returncode != 0:
+                if b"nothing to commit" in result.stdout + result.stderr:
+                    print("Index unchanged, nothing to commit.")
+                    return
+                raise subprocess.CalledProcessError(result.returncode, result.args)
+
+            push_result = subprocess.run(
+                ["git", "-C", tmpdir, "push"],
+                capture_output=True, env=git_env,
+            )
+            if push_result.returncode != 0:
+                print(
+                    f"WARNING: git push failed. Copy the following JSON to "
+                    f"index/skills.json in {INDEX_REPO} and commit manually "
+                    f"with message: chore: refresh skill index [skip ci]",
+                    file=sys.stderr,
+                )
+                print(json.dumps(index_data, indent=2))
                 return
-            raise subprocess.CalledProcessError(result.returncode, result.args)
 
-        subprocess.run(["git", "-C", tmpdir, "push"], check=True, capture_output=True)
+    finally:
+        os.unlink(askpass_path)
 
     print(f"Index updated: {len(skills)} skills indexed at {now}")
 
